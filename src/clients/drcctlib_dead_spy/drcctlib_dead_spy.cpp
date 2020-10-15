@@ -7,22 +7,12 @@
 #include <cstddef>
 
 #include "dr_api.h"
+#include "shadow_memory.h"
 #include "drmgr.h"
 #include "drreg.h"
 #include "drutil.h"
-#include "dr_tools.h"
 #include "drcctlib.h"
-
 #include <unordered_map>
-#include <set>
-#include <algorithm>
-#include <iostream>
-#include <utility>
-
-using namespace std;
-
-#define TLS_MEM_REF_BUFF_SIZE 100
-#define MAX_DEPTH_TO_BOTHER 30
 
 #define DRCCTLIB_PRINTF(format, args...) \
     DRCCTLIB_PRINTF_TEMPLATE("dead_spy", format, ##args)
@@ -31,6 +21,15 @@ using namespace std;
                                           ##args)
 
 static int tls_idx;
+
+struct shdwByte {
+    context_handle_t ctxt; // Probable dead context
+    uint8_t isWritten;
+} __attribute__((packed));
+
+static TlsShadowMemory<shdwByte> shdwMemory; // Shdw memory to store state information
+
+static unordered_map<uint64_t, uint64_t> memMap; // <{dead_context, killing_context}, frequency>
 
 enum {
     INSTRACE_TLS_OFFS_BUF_PTR,
@@ -47,11 +46,10 @@ static uint tls_offs;
 #    define OPND_CREATE_CCT_INT OPND_CREATE_INT32
 #endif
 
-static file_t gTraceFile;
-
 typedef struct _mem_ref_t {
     app_pc addr;
     size_t size;
+    uint8_t state = 0;
 } mem_ref_t;
 
 typedef struct _per_thread_t {
@@ -59,64 +57,46 @@ typedef struct _per_thread_t {
     void *cur_buf;
 } per_thread_t;
 
-// Store Continuous Memory Ranges as [left, right)
-struct interval{
-     long left, right;
-     bool operator < (const interval &parm) const {
-         return this->right < parm.left;
-     }
-} ;
-
-static unordered_map<context_handle_t, set<interval>> mem_references;
-
-// Add an interval to the list
-inline void __add_interval(set<interval>& intervals, const long& left, const long& right) {
-    auto ptrs = intervals.equal_range({left, right});
-    if(ptrs.first == ptrs.second){
-        intervals.insert({left, right});
-    }
-    else{
-        auto newLeft = min(ptrs.first->left, left);
-        auto newRight = max(prev(ptrs.second)->right, right);
-        intervals.erase(ptrs.first, ptrs.second);
-        intervals.insert({newLeft, newRight});
-    }
-}
-
-// Get the number of unique_bytes in the set
-inline unsigned int  __count_footprint(const set<interval>& intervals){
-    unsigned int ans = 0;
-    for (auto range_itr = intervals.begin(); range_itr != intervals.end(); range_itr++) {
-        ans += range_itr->right - range_itr->left;
-    }
-    return ans;
-}
+#define TLS_MEM_REF_BUFF_SIZE 100
 
 // client want to do
 void
-ComputeMemFootPrint(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref)
+FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref)
 {
-    long addr = (long)ref->addr;
-    if (addr){
-      // If the Map doesn't contain the Context Handle, Create an Entry i.e Set
-      if (mem_references.find(cur_ctxt_hndl) == mem_references.end()){
-          mem_references[cur_ctxt_hndl] = set<interval>{};
+      auto addr = (size_t)ref->addr;
+      auto shdwVal = shdwMemory.GetShadowAddress(addr);
+      if (!shdwVal){
+          shdwVal = shdwMemory.GetOrCreateShadowAddress(addr);
+          shdwVal->ctxt = cur_ctxt_hndl;
+          shdwVal->isWritten = ref->state;
       }
-      // Add the Bytes to the set associated with the key.
-      __add_interval(mem_references[cur_ctxt_hndl], addr, addr+ref->size);
-    }
-}
+      else if ((shdwVal->isWritten & ref->state & 0x01) == 0x01){ // Dead Write Identified
+          uint64_t key = 0;
+          key |= shdwVal->ctxt; // Dead Context
+          key <<= 32;
+          key |= cur_ctxt_hndl; // Killing Context
+          if (memMap.find(key) == memMap.end()){
+              memMap[key] = 0;
+          }
+          memMap[key]++;
+      }
+      else{
+          shdwVal->ctxt = cur_ctxt_hndl;
+          shdwVal->isWritten = ref->state;
+      }
 
+      return ;
+}
 // dr clean call
 void
-InsertCleancall(int32_t slot,int32_t num)
+InsertCleancall(int32_t slot, int32_t num)
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     context_handle_t cur_ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     for (int i = 0; i < num; i++) {
         if (pt->cur_buf_list[i].addr != 0) {
-            ComputeMemFootPrint(drcontext, cur_ctxt_hndl, &pt->cur_buf_list[i]);
+            FindDeadStores_Memory(drcontext, cur_ctxt_hndl, &pt->cur_buf_list[i]);
         }
     }
     BUF_PTR(pt->cur_buf, mem_ref_t, INSTRACE_TLS_OFFS_BUF_PTR) = pt->cur_buf_list;
@@ -124,7 +104,7 @@ InsertCleancall(int32_t slot,int32_t num)
 
 // insert
 static void
-InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref)
+InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, bool writeState)
 {
     /* We need two scratch registers */
     reg_id_t reg_mem_ref_ptr, free_reg;
@@ -142,6 +122,8 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref)
     }
     dr_insert_read_raw_tls(drcontext, ilist, where, tls_seg,
                            tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_mem_ref_ptr);
+
+
     // store mem_ref_t->addr
     MINSERT(ilist, where,
             XINST_CREATE_store(
@@ -174,6 +156,15 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref)
             XINST_CREATE_add(drcontext, opnd_create_reg(reg_mem_ref_ptr),
                              OPND_CREATE_CCT_INT(sizeof(mem_ref_t))));
 #endif
+
+    if (writeState){
+
+      // store mem_ref_t->state
+      MINSERT(ilist, where,
+              XINST_CREATE_store(drcontext, OPND_CREATE_MEMPTR(reg_mem_ref_ptr, offsetof(mem_ref_t, state)),
+                  OPND_CREATE_INT8(1)));
+    }
+
     dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_mem_ref_ptr);
     /* Restore scratch registers */
@@ -196,13 +187,13 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     for (int i = 0; i < instr_num_srcs(instr); i++) {
         if (opnd_is_memory_reference(instr_get_src(instr, i))) {
             num++;
-            InstrumentMem(drcontext, bb, instr, instr_get_src(instr, i));
+            InstrumentMem(drcontext, bb, instr, instr_get_src(instr, i), false);
         }
     }
     for (int i = 0; i < instr_num_dsts(instr); i++) {
         if (opnd_is_memory_reference(instr_get_dst(instr, i))) {
             num++;
-            InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i));
+            InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i), true);
         }
     }
     dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall, false, 2,
@@ -235,60 +226,13 @@ ClientThreadEnd(void *drcontext)
 static void
 ClientInit(int argc, const char *argv[])
 {
-#ifdef ARM_CCTLIB
-    char name[MAXIMUM_PATH] = "arm.drcctlib_dead_spy.log";
-#else
-    char name[MAXIMUM_PATH] = "x86.drcctlib_dead_spy.log";
-#endif
 
-  cout << "Creating log file at: " << name << endl;
-
-  gTraceFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
-  DR_ASSERT(gTraceFile != INVALID_FILE);
 }
 
 static void
 ClientExit(void)
 {
-    context_t* curr_context = NULL;
-
-    set<context_handle_t> parent_handles;
-
-    for (auto itr = mem_references.begin(); itr != mem_references.end(); itr++) {
-        curr_context = drcctlib_get_full_cct(itr->first, MAX_DEPTH_TO_BOTHER);
-        // Ignore Leaf Nodes (Instructions)
-        curr_context = curr_context->pre_ctxt;
-        while(curr_context){
-           // Store Parent Handles for Logging Which can usually are call instructions to child methods
-           // By Focussing on these Cntxt_handles, complete information from the child method is accumulated at this Handle
-           parent_handles.insert(curr_context->ctxt_hndl);
-           if (mem_references.find(curr_context->ctxt_hndl) == mem_references.end()) {
-               mem_references[curr_context->ctxt_hndl] = set<interval>{};
-           }
-           for (auto range_itr = itr->second.begin(); range_itr != itr->second.end(); range_itr++) {
-              __add_interval(mem_references[curr_context->ctxt_hndl], range_itr->left, range_itr->right);
-           }
-           curr_context = curr_context->pre_ctxt;
-        }
-    }
-
-    unsigned int i = 0;
-    for (auto cntxt_hndl : parent_handles) {
-        dr_fprintf(gTraceFile, "N0. %d  Memory FootPrint: %lld,  ctxt handle %lld ====", i + 1,
-                  __count_footprint(mem_references[cntxt_hndl]), cntxt_hndl);
-        drcctlib_print_ctxt_hndl_msg(gTraceFile, cntxt_hndl, false, false);
-        dr_fprintf(gTraceFile,
-                   "====================================================================="
-                   "===========\n");
-        drcctlib_print_full_cct(gTraceFile, cntxt_hndl, true, false,
-                                MAX_DEPTH_TO_BOTHER);
-        dr_fprintf(gTraceFile,
-                   "====================================================================="
-                   "===========\n\n\n");
-        ++i;
-    }
-
-    dr_close_file(gTraceFile);
+    // add output module here
     drcctlib_exit();
 
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
@@ -305,7 +249,6 @@ ClientExit(void)
     if (drreg_exit() != DRREG_SUCCESS) {
         DRCCTLIB_PRINTF("failed to exit drreg");
     }
-
     drutil_exit();
 }
 
