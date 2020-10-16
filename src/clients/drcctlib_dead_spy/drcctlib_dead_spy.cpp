@@ -5,6 +5,7 @@
  */
 
 #include <cstddef>
+#include <iostream>
 
 #include "dr_api.h"
 #include "shadow_memory.h"
@@ -13,6 +14,8 @@
 #include "drutil.h"
 #include "drcctlib.h"
 #include <unordered_map>
+#include <queue>
+
 
 #define DRCCTLIB_PRINTF(format, args...) \
     DRCCTLIB_PRINTF_TEMPLATE("dead_spy", format, ##args)
@@ -26,10 +29,6 @@ struct shdwByte {
     context_handle_t ctxt; // Probable dead context
     uint8_t isWritten;
 } __attribute__((packed));
-
-static TlsShadowMemory<shdwByte> shdwMemory; // Shdw memory to store state information
-
-static unordered_map<uint64_t, uint64_t> memMap; // <{dead_context, killing_context}, frequency>
 
 enum {
     INSTRACE_TLS_OFFS_BUF_PTR,
@@ -49,36 +48,48 @@ static uint tls_offs;
 typedef struct _mem_ref_t {
     app_pc addr;
     size_t size;
-    uint8_t state = 0;
+    ptr_int_t state = 0;
 } mem_ref_t;
 
 typedef struct _per_thread_t {
     mem_ref_t *cur_buf_list;
     void *cur_buf;
+    TlsShadowMemory<shdwByte> shdwMemory; // Shdw memory to store state information
+    unordered_map<uint64_t, uint64_t> memMap; // <{dead_context, killing_context}, frequency>
 } per_thread_t;
+
+// {<Dead Ctx, Killing Ctx>, frequency}
+using q_pair = pair<uint64_t, uint64_t>;
+
+struct pq_cmp{
+   bool operator()(const q_pair& a, const q_pair& b){
+      return a.second < b.second;
+   }
+};
 
 #define TLS_MEM_REF_BUFF_SIZE 100
 
 // client want to do
 void
-FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref)
+FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref, per_thread_t *pt)
 {
+      std::cout << " Find Dead Stores " << endl;
       auto addr = (size_t)ref->addr;
-      auto shdwVal = shdwMemory.GetShadowAddress(addr);
+      auto shdwVal = pt->shdwMemory.GetShadowAddress(addr);
       if (!shdwVal){
-          shdwVal = shdwMemory.GetOrCreateShadowAddress(addr);
+          shdwVal = pt->shdwMemory.GetOrCreateShadowAddress(addr);
           shdwVal->ctxt = cur_ctxt_hndl;
           shdwVal->isWritten = ref->state;
       }
-      else if ((shdwVal->isWritten & ref->state & 0x01) == 0x01){ // Dead Write Identified
+      else if ((shdwVal->isWritten & ref->state & 1) == 1){ // Dead Write Identified
           uint64_t key = 0;
           key |= shdwVal->ctxt; // Dead Context
           key <<= 32;
           key |= cur_ctxt_hndl; // Killing Context
-          if (memMap.find(key) == memMap.end()){
-              memMap[key] = 0;
+          if (pt->memMap.find(key) == pt->memMap.end()){
+              pt->memMap[key] = 0;
           }
-          memMap[key]++;
+          pt->memMap[key]++;
       }
       else{
           shdwVal->ctxt = cur_ctxt_hndl;
@@ -96,7 +107,7 @@ InsertCleancall(int32_t slot, int32_t num)
     context_handle_t cur_ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
     for (int i = 0; i < num; i++) {
         if (pt->cur_buf_list[i].addr != 0) {
-            FindDeadStores_Memory(drcontext, cur_ctxt_hndl, &pt->cur_buf_list[i]);
+            FindDeadStores_Memory(drcontext, cur_ctxt_hndl, &pt->cur_buf_list[i], pt);
         }
     }
     BUF_PTR(pt->cur_buf, mem_ref_t, INSTRACE_TLS_OFFS_BUF_PTR) = pt->cur_buf_list;
@@ -130,6 +141,15 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, b
                 drcontext, OPND_CREATE_MEMPTR(reg_mem_ref_ptr, offsetof(mem_ref_t, addr)),
                 opnd_create_reg(free_reg)));
 
+    // store mem_ref_t->state
+    if (writeState){
+        MINSERT(ilist, where,
+                 XINST_CREATE_store(
+                   drcontext, OPND_CREATE_MEMPTR(reg_mem_ref_ptr, offsetof(mem_ref_t, state)),
+                   OPND_CREATE_INT32(1)));
+    }
+
+
     // store mem_ref_t->size
 #ifdef ARM_CCTLIB
     MINSERT(ilist, where,
@@ -157,14 +177,6 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, b
                              OPND_CREATE_CCT_INT(sizeof(mem_ref_t))));
 #endif
 
-    if (writeState){
-
-      // store mem_ref_t->state
-      MINSERT(ilist, where,
-              XINST_CREATE_store(drcontext, OPND_CREATE_MEMPTR(reg_mem_ref_ptr, offsetof(mem_ref_t, state)),
-                  OPND_CREATE_INT8(1)));
-    }
-
     dr_insert_write_raw_tls(drcontext, ilist, where, tls_seg,
                             tls_offs + INSTRACE_TLS_OFFS_BUF_PTR, reg_mem_ref_ptr);
     /* Restore scratch registers */
@@ -179,7 +191,6 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, b
 void
 InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 {
-
     instrlist_t *bb = instrument_msg->bb;
     instr_t *instr = instrument_msg->instr;
     int32_t slot = instrument_msg->slot;
@@ -196,6 +207,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
             InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i), true);
         }
     }
+    std::cout << " Instrumentation Completed " << std::endl;
     dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall, false, 2,
                          OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num));
 }
@@ -219,6 +231,36 @@ static void
 ClientThreadEnd(void *drcontext)
 {
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+
+    // Extract Top 100 Dead Writes
+    std::priority_queue<q_pair, vector<q_pair>, pq_cmp> Q;
+
+    auto total_occurences = 0;
+    for (auto val : pt->memMap){
+
+        if (Q.size() < 100){
+            Q.push(val);
+        }
+        else{
+            if (Q.top().second < val.second){
+              Q.pop();
+              Q.push(val);
+            }
+        }
+        total_occurences += val.second;
+    }
+
+    printf("dead occurrences: %d \n\n", total_occurences);
+
+    while(!Q.empty()){
+       auto dead_ctxt = (Q.top().first & 0xFFFFFFFF00000000);
+       dead_ctxt >>= 32;
+       auto killing_ctxt = Q.top().first & 0x00000000FFFFFFFF;
+
+       printf("Dead Context: %ld, Killing Context: %ld, Frequency: %ld \n", dead_ctxt, killing_ctxt, Q.top().second);
+       Q.pop();
+    }
+
     dr_global_free(pt->cur_buf_list, TLS_MEM_REF_BUFF_SIZE * sizeof(mem_ref_t));
     dr_thread_free(drcontext, pt, sizeof(per_thread_t));
 }
@@ -228,6 +270,8 @@ ClientInit(int argc, const char *argv[])
 {
 
 }
+
+
 
 static void
 ClientExit(void)
