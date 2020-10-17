@@ -80,12 +80,9 @@ FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t
       //std::cout << " Find Dead Stores " << endl;
       auto addr = (size_t)ref->addr;
       auto shdwVal = pt->shdwMemory->GetShadowAddress(addr);
-      if (!shdwVal){
-          shdwVal = pt->shdwMemory->GetOrCreateShadowAddress(addr);
-          shdwVal->ctxt = cur_ctxt_hndl;
-          shdwVal->isWritten = ref->state;
-      }
-      else if ((shdwVal->isWritten & ref->state & 1) == 1){ // Dead Write Identified
+
+      // Dead Write Identified
+      if (shdwVal && (shdwVal->isWritten & ref->state & 1) == 1){
           uint64_t key = 0;
           key |= shdwVal->ctxt; // Dead Context
           key <<= 32;
@@ -95,10 +92,13 @@ FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t
           }
           pt->memMap->at(key)++;
       }
-      else{
-          shdwVal->ctxt = cur_ctxt_hndl;
-          shdwVal->isWritten = ref->state;
+
+      if (!shdwVal){
+          shdwVal = pt->shdwMemory->GetOrCreateShadowAddress(addr);
       }
+
+      shdwVal->ctxt = cur_ctxt_hndl;
+      shdwVal->isWritten = ref->state;
 
       return ;
 }
@@ -118,15 +118,15 @@ InsertCleancall_memory(int32_t slot, int32_t num)
 }
 
 void
-InsertCleancall_register(int32_t slot, int32_t num, reg_id_t reg, int32_t state){
+InsertCleancall_register(int32_t slot, reg_id_t reg, int32_t state){
 
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
     context_handle_t cur_ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
 
-    if (((state & 1) == 1)
-            && (pt->regState->find(reg) != pt->regState->end())
-                && (pt->regState->at(reg).isWritten & 1) == 1){ // Dead Write Identified
+    // Dead Write Identified
+    if ((pt->regState->find(reg) != pt->regState->end())
+                && (state & pt->regState->at(reg).isWritten & 1) == 1){
         uint64_t key = 0;
         key |= pt->regState->at(reg).ctxt; // Dead Context
         key <<= 32;
@@ -136,16 +136,14 @@ InsertCleancall_register(int32_t slot, int32_t num, reg_id_t reg, int32_t state)
         }
         pt->regMap->at(key)++;
     }
-    else{
-        if (pt->regState->find(reg) == pt->regState->end()){
-           pt->regState->emplace(reg, stateWord(cur_ctxt_hndl, (uint8_t)state));
-        }
-        else{
-           pt->regState->at(reg).isWritten = state;
-           pt->regState->at(reg).ctxt = cur_ctxt_hndl;
-        }
-    }
 
+    if (pt->regState->find(reg) == pt->regState->end()){
+       pt->regState->emplace(reg, stateWord(cur_ctxt_hndl, (uint8_t)state));
+    }
+    else{
+       pt->regState->at(reg).isWritten = (uint8_t)state;
+       pt->regState->at(reg).ctxt = cur_ctxt_hndl;
+    }
 }
 
 // insert
@@ -232,25 +230,31 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     int num = 0;
     for (int i = 0; i < instr_num_srcs(instr); i++) {
         opnd_t op = instr_get_src(instr, i);
-        auto reg = opnd_get_reg(op);
         if (opnd_is_memory_reference(op)) {
             num++;
             InstrumentMem(drcontext, bb, instr, instr_get_src(instr, i), false);
         }
-        dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 4,
-                            OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(0));
+
+        // Loop over any number of registers present in a operand
+        int num_temp = opnd_num_regs_used(op);
+        for (int j = 0; j < num_temp; j++){
+            auto reg = opnd_get_reg_used(op, j);
+            dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 3,
+                                OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(0));
+        }
+
     }
     for (int i = 0; i < instr_num_dsts(instr); i++) {
         opnd_t op = instr_get_dst(instr, i);
-        auto reg = opnd_get_reg(op);
         int isReg = 1;
         if (opnd_is_memory_reference(op)) {
             num++;
             InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i), true);
             isReg = 0;
         }
-        dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 4,
-                             OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(isReg));
+        auto reg = opnd_get_reg(op);
+        dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 3,
+                             OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(isReg));
 
     }
     dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_memory, false, 2,
@@ -320,11 +324,11 @@ ClientThreadEnd(void *drcontext)
     // Extract Top 100 Dead Writes
     std::priority_queue<q_pair, vector<q_pair>, pq_cmp> Q;
 
-    printf(" \n\n --------------------- Memory dead occurrences: %d ------------------------- \n\n", Top100Freq(Q, pt->memMap));
+    printf(" \n\n ------ Total Memory dead Writes Identified: %d, Total Pairs Identified: %d -------------------- \n\n", Top100Freq(Q, pt->memMap), (int)pt->memMap->size());
 
     print_stats(Q);
 
-    printf(" \n\n --------------------- Register dead occurrences: %d ------------------------- \n\n", Top100Freq(Q, pt->regMap));
+    printf(" \n\n ------ Total Register dead Writes Identified: %d, Total Pairs Identified: %d ------------------------- \n\n", Top100Freq(Q, pt->regMap), (int)pt->regMap->size());
 
     print_stats(Q);
 
