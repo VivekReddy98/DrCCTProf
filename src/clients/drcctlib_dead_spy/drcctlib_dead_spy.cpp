@@ -25,7 +25,7 @@
 
 static int tls_idx;
 
-struct shdwByte {
+struct shdwWord {
     context_handle_t ctxt; // Probable dead context
     uint8_t isWritten;
 } __attribute__((packed));
@@ -54,8 +54,8 @@ typedef struct _mem_ref_t {
 typedef struct _per_thread_t {
     mem_ref_t *cur_buf_list;
     void *cur_buf;
-    TlsShadowMemory<shdwByte> shdwMemory; // Shdw memory to store state information
-    unordered_map<uint64_t, uint64_t> memMap; // <{dead_context, killing_context}, frequency>
+    TlsShadowMemory<shdwWord>* shdwMemory; // Shdw memory to store state information
+    unordered_map<uint64_t, uint64_t>* memMap; // <{dead_context, killing_context}, frequency>
 } per_thread_t;
 
 // {<Dead Ctx, Killing Ctx>, frequency}
@@ -73,11 +73,11 @@ struct pq_cmp{
 void
 FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t *ref, per_thread_t *pt)
 {
-      std::cout << " Find Dead Stores " << endl;
+      //std::cout << " Find Dead Stores " << endl;
       auto addr = (size_t)ref->addr;
-      auto shdwVal = pt->shdwMemory.GetShadowAddress(addr);
+      auto shdwVal = pt->shdwMemory->GetShadowAddress(addr);
       if (!shdwVal){
-          shdwVal = pt->shdwMemory.GetOrCreateShadowAddress(addr);
+          shdwVal = pt->shdwMemory->GetOrCreateShadowAddress(addr);
           shdwVal->ctxt = cur_ctxt_hndl;
           shdwVal->isWritten = ref->state;
       }
@@ -86,10 +86,10 @@ FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t
           key |= shdwVal->ctxt; // Dead Context
           key <<= 32;
           key |= cur_ctxt_hndl; // Killing Context
-          if (pt->memMap.find(key) == pt->memMap.end()){
-              pt->memMap[key] = 0;
+          if (pt->memMap->find(key) == pt->memMap->end()){
+              pt->memMap->emplace(key, 0);
           }
-          pt->memMap[key]++;
+              pt->memMap->at(key)++;
       }
       else{
           shdwVal->ctxt = cur_ctxt_hndl;
@@ -207,7 +207,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
             InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i), true);
         }
     }
-    std::cout << " Instrumentation Completed " << std::endl;
+    //std::cout << " Instrumentation Completed " << std::endl;
     dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall, false, 2,
                          OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num));
 }
@@ -225,6 +225,9 @@ ClientThreadStart(void *drcontext)
     pt->cur_buf_list =
         (mem_ref_t *)dr_global_alloc(TLS_MEM_REF_BUFF_SIZE * sizeof(mem_ref_t));
     BUF_PTR(pt->cur_buf, mem_ref_t, INSTRACE_TLS_OFFS_BUF_PTR) = pt->cur_buf_list;
+
+    pt->shdwMemory = new TlsShadowMemory<shdwWord>();
+    pt->memMap = new unordered_map<uint64_t, uint64_t>();
 }
 
 static void
@@ -236,7 +239,7 @@ ClientThreadEnd(void *drcontext)
     std::priority_queue<q_pair, vector<q_pair>, pq_cmp> Q;
 
     auto total_occurences = 0;
-    for (auto val : pt->memMap){
+    for (auto val : *(pt->memMap)){
 
         if (Q.size() < 100){
             Q.push(val);
@@ -261,6 +264,8 @@ ClientThreadEnd(void *drcontext)
        Q.pop();
     }
 
+    delete pt->shdwMemory;
+    delete pt->memMap;
     dr_global_free(pt->cur_buf_list, TLS_MEM_REF_BUFF_SIZE * sizeof(mem_ref_t));
     dr_thread_free(drcontext, pt, sizeof(per_thread_t));
 }
