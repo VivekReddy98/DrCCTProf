@@ -14,6 +14,7 @@
 #include "drutil.h"
 #include "drcctlib.h"
 #include <unordered_map>
+#include <unordered_set>
 #include <queue>
 
 
@@ -25,9 +26,10 @@
 
 static int tls_idx;
 
-struct shdwWord {
+struct stateWord {
     context_handle_t ctxt; // Probable dead context
     uint8_t isWritten;
+    stateWord(context_handle_t ctxt, uint8_t isWritten) : ctxt(ctxt), isWritten(isWritten) {}
 } __attribute__((packed));
 
 enum {
@@ -54,8 +56,10 @@ typedef struct _mem_ref_t {
 typedef struct _per_thread_t {
     mem_ref_t *cur_buf_list;
     void *cur_buf;
-    TlsShadowMemory<shdwWord>* shdwMemory; // Shdw memory to store state information
+    TlsShadowMemory<stateWord>* shdwMemory; // Shdw memory to store state information
     unordered_map<uint64_t, uint64_t>* memMap; // <{dead_context, killing_context}, frequency>
+    unordered_map<uint64_t, uint64_t>* regMap; // <{dead_context, killing_context}, frequency>
+    unordered_map<reg_id_t, stateWord>* regState; // Set of registers which are in written state
 } per_thread_t;
 
 // {<Dead Ctx, Killing Ctx>, frequency}
@@ -89,7 +93,7 @@ FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t
           if (pt->memMap->find(key) == pt->memMap->end()){
               pt->memMap->emplace(key, 0);
           }
-              pt->memMap->at(key)++;
+          pt->memMap->at(key)++;
       }
       else{
           shdwVal->ctxt = cur_ctxt_hndl;
@@ -100,7 +104,7 @@ FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t
 }
 // dr clean call
 void
-InsertCleancall(int32_t slot, int32_t num)
+InsertCleancall_memory(int32_t slot, int32_t num)
 {
     void *drcontext = dr_get_current_drcontext();
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
@@ -111,6 +115,37 @@ InsertCleancall(int32_t slot, int32_t num)
         }
     }
     BUF_PTR(pt->cur_buf, mem_ref_t, INSTRACE_TLS_OFFS_BUF_PTR) = pt->cur_buf_list;
+}
+
+void
+InsertCleancall_register(int32_t slot, int32_t num, reg_id_t reg, int32_t state){
+
+    void *drcontext = dr_get_current_drcontext();
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+    context_handle_t cur_ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
+
+    if (((state & 1) == 1)
+            && (pt->regState->find(reg) != pt->regState->end())
+                && (pt->regState->at(reg).isWritten & 1) == 1){ // Dead Write Identified
+        uint64_t key = 0;
+        key |= pt->regState->at(reg).ctxt; // Dead Context
+        key <<= 32;
+        key |= cur_ctxt_hndl; // Killing Context
+        if (pt->regMap->find(key) == pt->regMap->end()){
+            pt->regMap->emplace(key, 0);
+        }
+        pt->regMap->at(key)++;
+    }
+    else{
+        if (pt->regState->find(reg) == pt->regState->end()){
+           pt->regState->emplace(reg, stateWord(cur_ctxt_hndl, (uint8_t)state));
+        }
+        else{
+           pt->regState->at(reg).isWritten = state;
+           pt->regState->at(reg).ctxt = cur_ctxt_hndl;
+        }
+    }
+
 }
 
 // insert
@@ -196,19 +231,29 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
     int32_t slot = instrument_msg->slot;
     int num = 0;
     for (int i = 0; i < instr_num_srcs(instr); i++) {
-        if (opnd_is_memory_reference(instr_get_src(instr, i))) {
+        opnd_t op = instr_get_src(instr, i);
+        auto reg = opnd_get_reg(op);
+        if (opnd_is_memory_reference(op)) {
             num++;
             InstrumentMem(drcontext, bb, instr, instr_get_src(instr, i), false);
         }
+        dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 4,
+                            OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(0));
     }
     for (int i = 0; i < instr_num_dsts(instr); i++) {
-        if (opnd_is_memory_reference(instr_get_dst(instr, i))) {
+        opnd_t op = instr_get_dst(instr, i);
+        auto reg = opnd_get_reg(op);
+        int isReg = 1;
+        if (opnd_is_memory_reference(op)) {
             num++;
             InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i), true);
+            isReg = 0;
         }
+        dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 4,
+                             OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(isReg));
+
     }
-    //std::cout << " Instrumentation Completed " << std::endl;
-    dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall, false, 2,
+    dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_memory, false, 2,
                          OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num));
 }
 
@@ -226,21 +271,17 @@ ClientThreadStart(void *drcontext)
         (mem_ref_t *)dr_global_alloc(TLS_MEM_REF_BUFF_SIZE * sizeof(mem_ref_t));
     BUF_PTR(pt->cur_buf, mem_ref_t, INSTRACE_TLS_OFFS_BUF_PTR) = pt->cur_buf_list;
 
-    pt->shdwMemory = new TlsShadowMemory<shdwWord>();
+    pt->shdwMemory = new TlsShadowMemory<stateWord>();
     pt->memMap = new unordered_map<uint64_t, uint64_t>();
+    pt->regMap = new unordered_map<uint64_t, uint64_t>();
+    pt->regState = new unordered_map<reg_id_t, stateWord>();
 }
 
-static void
-ClientThreadEnd(void *drcontext)
-{
-    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
-
-    // Extract Top 100 Dead Writes
-    std::priority_queue<q_pair, vector<q_pair>, pq_cmp> Q;
-
+static int
+Top100Freq(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q, unordered_map<uint64_t, uint64_t>* ump){
     auto total_occurences = 0;
-    for (auto val : *(pt->memMap)){
 
+    for (auto val : *(ump)){
         if (Q.size() < 100){
             Q.push(val);
         }
@@ -253,19 +294,44 @@ ClientThreadEnd(void *drcontext)
         total_occurences += val.second;
     }
 
-    printf("dead occurrences: %d \n\n", total_occurences);
+    return total_occurences;
+}
 
-    while(!Q.empty()){
-       auto dead_ctxt = (Q.top().first & 0xFFFFFFFF00000000);
-       dead_ctxt >>= 32;
-       auto killing_ctxt = Q.top().first & 0x00000000FFFFFFFF;
+static void
+print_stats(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q){
+  while(!Q.empty()){
+     auto dead_ctxt = (Q.top().first & 0xFFFFFFFF00000000);
+     dead_ctxt >>= 32;
+     auto killing_ctxt = Q.top().first & 0x00000000FFFFFFFF;
 
-       printf("Dead Context: %ld, Killing Context: %ld, Frequency: %ld \n", dead_ctxt, killing_ctxt, Q.top().second);
-       Q.pop();
-    }
+     printf("Dead Context: %ld, Killing Context: %ld, Frequency: %ld \n", dead_ctxt, killing_ctxt, Q.top().second);
+     Q.pop();
+  }
+}
+
+static void
+ClientThreadEnd(void *drcontext)
+{
+
+    per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
+
+    // std::cout <<  pt->memMap->size() << " " << pt->regMap->size() << endl;
+
+    // Extract Top 100 Dead Writes
+    std::priority_queue<q_pair, vector<q_pair>, pq_cmp> Q;
+
+    printf(" \n\n --------------------- Memory dead occurrences: %d ------------------------- \n\n", Top100Freq(Q, pt->memMap));
+
+    print_stats(Q);
+
+    printf(" \n\n --------------------- Register dead occurrences: %d ------------------------- \n\n", Top100Freq(Q, pt->regMap));
+
+    print_stats(Q);
 
     delete pt->shdwMemory;
     delete pt->memMap;
+    delete pt->regMap;
+    delete pt->regState;
     dr_global_free(pt->cur_buf_list, TLS_MEM_REF_BUFF_SIZE * sizeof(mem_ref_t));
     dr_thread_free(drcontext, pt, sizeof(per_thread_t));
 }
