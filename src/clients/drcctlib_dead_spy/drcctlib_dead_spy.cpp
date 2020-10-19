@@ -366,7 +366,7 @@ ClientThreadEnd(void *drcontext)
 
     print_stats(Q, "Memory", dead_occ);
 
-    Q = Top100Freq(pt->memMap, dead_occ);
+    Q = Top100Freq(pt->regMap, dead_occ);
 
     print_stats(Q, "Registers", dead_occ);
 
