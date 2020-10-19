@@ -17,6 +17,9 @@
 #include <unordered_set>
 #include <queue>
 
+#define MAX_DEPTH_TO_BOTHER 10
+
+#define MAXFREQ 10
 
 #define DRCCTLIB_PRINTF(format, args...) \
     DRCCTLIB_PRINTF_TEMPLATE("dead_spy", format, ##args)
@@ -25,6 +28,8 @@
                                           ##args)
 
 static int tls_idx;
+
+static file_t gTraceFile;
 
 struct stateWord {
     context_handle_t ctxt; // Probable dead context
@@ -281,12 +286,15 @@ ClientThreadStart(void *drcontext)
     pt->regState = new unordered_map<reg_id_t, stateWord>();
 }
 
-static int
-Top100Freq(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q, unordered_map<uint64_t, uint64_t>* ump){
-    auto total_occurences = 0;
+static priority_queue<q_pair, vector<q_pair>, pq_cmp>
+Top100Freq(unordered_map<uint64_t, uint64_t>* ump, int& total_occurences){
+
+    priority_queue<q_pair, vector<q_pair>, pq_cmp> Q;
+
+    total_occurences = 0;
 
     for (auto val : *(ump)){
-        if (Q.size() < 100){
+        if (Q.size() < 10){
             Q.push(val);
         }
         else{
@@ -298,18 +306,41 @@ Top100Freq(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q, unordered_map<uint
         total_occurences += val.second;
     }
 
-    return total_occurences;
+    return Q;
 }
 
 static void
-print_stats(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q){
-  while(!Q.empty()){
-     auto dead_ctxt = (Q.top().first & 0xFFFFFFFF00000000);
-     dead_ctxt >>= 32;
-     auto killing_ctxt = Q.top().first & 0x00000000FFFFFFFF;
+print_stats(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q, const string& name, int dead_occ){
 
-     printf("Dead Context: %ld, Killing Context: %ld, Frequency: %ld \n", dead_ctxt, killing_ctxt, Q.top().second);
-     Q.pop();
+  dr_fprintf(gTraceFile, "================================================ Total Dead Occurences for %s : %d \
+  ========================================= \n\n", name.c_str(), dead_occ);
+
+  unsigned int i = 0;
+
+  while (!Q.empty()) {
+
+      auto dead_ctxt = (Q.top().first & 0xFFFFFFFF00000000);
+      dead_ctxt >>= 32;
+      auto killing_ctxt = (Q.top().first & 0x00000000FFFFFFFF);
+
+      dr_fprintf(gTraceFile, "N0. %d  Dead Context: %lld,  Killing Context: %lld, Frequency: %d ==== \n", i + 1,
+                dead_ctxt, killing_ctxt, Q.top().second);
+
+      //drcctlib_print_ctxt_hndl_msg(gTraceFile, cntxt_hndl, false, false);
+      dr_fprintf(gTraceFile,
+                 "====================================================================="
+                 "===========\n");
+      drcctlib_print_full_cct(gTraceFile, dead_ctxt, true, false,
+                              MAX_DEPTH_TO_BOTHER);
+      dr_fprintf(gTraceFile,
+                 "***********************\n");
+      drcctlib_print_full_cct(gTraceFile, killing_ctxt, true, false,
+                             MAX_DEPTH_TO_BOTHER);
+      dr_fprintf(gTraceFile,
+                 "====================================================================="
+                 "===========\n\n\n");
+      ++i;
+      Q.pop();
   }
 }
 
@@ -319,23 +350,23 @@ ClientThreadEnd(void *drcontext)
 
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 
-    // std::cout <<  pt->memMap->size() << " " << pt->regMap->size() << endl;
+    int dead_occ;
 
-    // Extract Top 100 Dead Writes
-    std::priority_queue<q_pair, vector<q_pair>, pq_cmp> Q;
+    auto Q = Top100Freq(pt->memMap, dead_occ);
 
-    printf(" \n\n ------ Total Memory dead Writes Identified: %d, Total Pairs Identified: %d -------------------- \n\n", Top100Freq(Q, pt->memMap), (int)pt->memMap->size());
+    print_stats(Q, "Memory", dead_occ);
 
-    print_stats(Q);
+    Q = Top100Freq(pt->memMap, dead_occ);
 
-    printf(" \n\n ------ Total Register dead Writes Identified: %d, Total Pairs Identified: %d ------------------------- \n\n", Top100Freq(Q, pt->regMap), (int)pt->regMap->size());
+    print_stats(Q, "Registers", dead_occ);
 
-    print_stats(Q);
+
 
     delete pt->shdwMemory;
     delete pt->memMap;
     delete pt->regMap;
     delete pt->regState;
+
     dr_global_free(pt->cur_buf_list, TLS_MEM_REF_BUFF_SIZE * sizeof(mem_ref_t));
     dr_thread_free(drcontext, pt, sizeof(per_thread_t));
 }
@@ -343,7 +374,16 @@ ClientThreadEnd(void *drcontext)
 static void
 ClientInit(int argc, const char *argv[])
 {
+  #ifdef ARM_CCTLIB
+      char name[MAXIMUM_PATH] = "arm.drcctlib_dead_spy.log";
+  #else
+      char name[MAXIMUM_PATH] = "x86.drcctlib_dead_spy.log";
+  #endif
 
+    cout << "Creating log file at: " << name << endl;
+
+    gTraceFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
+    DR_ASSERT(gTraceFile != INVALID_FILE);
 }
 
 
@@ -352,6 +392,7 @@ static void
 ClientExit(void)
 {
     // add output module here
+    dr_close_file(gTraceFile);
     drcctlib_exit();
 
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {
