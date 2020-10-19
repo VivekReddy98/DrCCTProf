@@ -20,6 +20,8 @@
 #define MAX_DEPTH_TO_BOTHER 10
 
 #define MAXFREQ 10
+#define REF_WRITE 1
+
 
 #define DRCCTLIB_PRINTF(format, args...) \
     DRCCTLIB_PRINTF_TEMPLATE("dead_spy", format, ##args)
@@ -34,7 +36,7 @@ static file_t gTraceFile;
 struct stateWord {
     context_handle_t ctxt; // Probable dead context
     uint8_t isWritten;
-    stateWord(context_handle_t ctxt, uint8_t isWritten) : ctxt(ctxt), isWritten(isWritten) {}
+    stateWord(context_handle_t ctxt, int isWritten) : ctxt(ctxt), isWritten(isWritten) {}
 } __attribute__((packed));
 
 enum {
@@ -64,7 +66,7 @@ typedef struct _per_thread_t {
     TlsShadowMemory<stateWord>* shdwMemory; // Shdw memory to store state information
     unordered_map<uint64_t, uint64_t>* memMap; // <{dead_context, killing_context}, frequency>
     unordered_map<uint64_t, uint64_t>* regMap; // <{dead_context, killing_context}, frequency>
-    unordered_map<reg_id_t, stateWord>* regState; // Set of registers which are in written state
+    unordered_map<reg_id_t, stateWord>* regState; // State of registers
 } per_thread_t;
 
 // {<Dead Ctx, Killing Ctx>, frequency}
@@ -88,8 +90,7 @@ FindDeadStores_Memory(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t
 
       // Dead Write Identified
       if (shdwVal && (shdwVal->isWritten & ref->state & 1) == 1){
-          uint64_t key = 0;
-          key |= shdwVal->ctxt; // Dead Context
+          uint64_t key = shdwVal->ctxt;
           key <<= 32;
           key |= cur_ctxt_hndl; // Killing Context
           if (pt->memMap->find(key) == pt->memMap->end()){
@@ -131,7 +132,7 @@ InsertCleancall_register(int32_t slot, reg_id_t reg, int32_t state){
 
     // Dead Write Identified
     if ((pt->regState->find(reg) != pt->regState->end())
-                && (state & pt->regState->at(reg).isWritten & 1) == 1){
+                && (state & pt->regState->at(reg).isWritten & REF_WRITE) == REF_WRITE){
         uint64_t key = 0;
         key |= pt->regState->at(reg).ctxt; // Dead Context
         key <<= 32;
@@ -185,6 +186,12 @@ InstrumentMem(void *drcontext, instrlist_t *ilist, instr_t *where, opnd_t ref, b
                  XINST_CREATE_store(
                    drcontext, OPND_CREATE_MEMPTR(reg_mem_ref_ptr, offsetof(mem_ref_t, state)),
                    OPND_CREATE_INT32(1)));
+    }
+    else{
+       MINSERT(ilist, where,
+               XINST_CREATE_store(
+                 drcontext, OPND_CREATE_MEMPTR(reg_mem_ref_ptr, offsetof(mem_ref_t, state)),
+                 OPND_CREATE_INT32(0)));
     }
 
 
@@ -257,10 +264,13 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
             InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i), true);
             isReg = 0;
         }
-        auto reg = opnd_get_reg(op);
-        dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 3,
-                             OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(isReg));
-
+        //auto reg = opnd_get_reg(op);
+        int num_temp = opnd_num_regs_used(op);
+        for (int j = 0; j < num_temp; j++){
+            auto reg = opnd_get_reg_used(op, j);
+            dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 3,
+                                 OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(isReg));
+        }
     }
     dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_memory, false, 2,
                          OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(num));
