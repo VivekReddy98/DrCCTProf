@@ -14,7 +14,7 @@
 #include "drutil.h"
 #include "drcctlib.h"
 #include <unordered_map>
-#include <unordered_set>
+#include <stack>
 #include <queue>
 
 #define MAX_DEPTH_TO_BOTHER 10
@@ -73,7 +73,7 @@ using q_pair = pair<uint64_t, uint64_t>;
 
 struct pq_cmp{
    bool operator()(const q_pair& a, const q_pair& b){
-      return a.second < b.second;
+      return a.second > b.second;
    }
 };
 
@@ -260,11 +260,15 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
 
     for (int i = 0; i < instr_num_dsts(instr); i++) {
         opnd_t op = instr_get_dst(instr, i);
-        int isReg = 1;
+
         if (opnd_is_memory_reference(op)) {
             num++;
             InstrumentMem(drcontext, bb, instr, instr_get_dst(instr, i), true);
-            isReg = 0;
+        }
+
+        int isReg = 0;
+        if (opnd_is_reg(op)){
+            isReg = 1;
         }
         //auto reg = opnd_get_reg(op);
         int num_temp = opnd_num_regs_used(op);
@@ -307,7 +311,7 @@ Top100Freq(unordered_map<uint64_t, uint64_t>* ump, int& total_occurences){
     total_occurences = 0;
 
     for (auto val : *(ump)){
-        if (Q.size() < 10){
+        if (Q.size() < MAXFREQ){
             Q.push(val);
         }
         else{
@@ -325,19 +329,27 @@ Top100Freq(unordered_map<uint64_t, uint64_t>* ump, int& total_occurences){
 static void
 print_stats(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q, const string& name, int dead_occ){
 
+  stack<pair<uint64_t, uint64_t>> stk;
+
+  while (!Q.empty()){
+      stk.push(Q.top());
+      Q.pop();
+  }
+
+
   dr_fprintf(gTraceFile, "================================================ Total Dead Occurences for %s : %d \
   ========================================= \n\n", name.c_str(), dead_occ);
 
   unsigned int i = 0;
 
-  while (!Q.empty()) {
+  while (!stk.empty()) {
 
-      auto dead_ctxt = (Q.top().first & 0xFFFFFFFF00000000);
+      auto dead_ctxt = (stk.top().first & 0xFFFFFFFF00000000);
       dead_ctxt >>= 32;
-      auto killing_ctxt = (Q.top().first & 0x00000000FFFFFFFF);
+      auto killing_ctxt = (stk.top().first & 0x00000000FFFFFFFF);
 
       dr_fprintf(gTraceFile, "N0. %d  Dead Context: %lld,  Killing Context: %lld, Frequency: %d ==== \n", i + 1,
-                dead_ctxt, killing_ctxt, Q.top().second);
+                dead_ctxt, killing_ctxt, stk.top().second);
 
       //drcctlib_print_ctxt_hndl_msg(gTraceFile, cntxt_hndl, false, false);
       dr_fprintf(gTraceFile,
@@ -353,7 +365,7 @@ print_stats(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q, const string& nam
                  "====================================================================="
                  "===========\n\n\n");
       ++i;
-      Q.pop();
+      stk.pop();
   }
 }
 
