@@ -18,10 +18,8 @@
 #include <queue>
 
 #define MAX_DEPTH_TO_BOTHER 10
-
-#define MAXFREQ 10
+#define MAXFREQ 100
 #define REF_WRITE 1
-
 
 #define DRCCTLIB_PRINTF(format, args...) \
     DRCCTLIB_PRINTF_TEMPLATE("dead_spy", format, ##args)
@@ -29,13 +27,11 @@
     DRCCTLIB_CLIENT_EXIT_PROCESS_TEMPLATE("dead_spy", format, \
                                           ##args)
 
-static int tls_idx;
-
 static file_t gTraceFile;
 
 struct stateWord {
     context_handle_t ctxt; // Probable dead context
-    uint8_t isWritten;
+    ptr_int_t isWritten;
     stateWord(context_handle_t ctxt, int isWritten) : ctxt(ctxt), isWritten(isWritten) {}
 } __attribute__((packed));
 
@@ -43,8 +39,11 @@ enum {
     INSTRACE_TLS_OFFS_BUF_PTR,
     INSTRACE_TLS_COUNT, /* total number of TLS slots allocated */
 };
+
+static int tls_idx;
 static reg_id_t tls_seg;
 static uint tls_offs;
+
 #define TLS_SLOT(tls_base, enum_val) (void **)((byte *)(tls_base) + tls_offs + (enum_val))
 #define BUF_PTR(tls_base, type, offs) *(type **)TLS_SLOT(tls_base, offs)
 #define MINSERT instrlist_meta_preinsert
@@ -131,23 +130,25 @@ InsertCleancall_register(int32_t slot, reg_id_t reg, int32_t state){
     context_handle_t cur_ctxt_hndl = drcctlib_get_context_handle(drcontext, slot);
 
     // Dead Write Identified
-    if ((pt->regState->find(reg) != pt->regState->end())
-                && (state & pt->regState->at(reg).isWritten & REF_WRITE) == REF_WRITE){
-        uint64_t key = 0;
-        key |= pt->regState->at(reg).ctxt; // Dead Context
+    if (pt->regState->find(reg) != pt->regState->end()
+                && ((state & pt->regState->at(reg).isWritten & REF_WRITE) == REF_WRITE)){
+        uint64_t key = pt->regState->at(reg).ctxt;
         key <<= 32;
         key |= cur_ctxt_hndl; // Killing Context
+        // printf("Destination Reg in Clean Call: %d, Dead: %d, Killing: %d \n", reg, pt->regState->at(reg).ctxt, cur_ctxt_hndl);
+        //std::cout << "Dead Context: " << pt->regState->at(reg).ctxt << " Killing Context: " << cur_ctxt_hndl << std::endl;
         if (pt->regMap->find(key) == pt->regMap->end()){
             pt->regMap->emplace(key, 0);
         }
-        pt->regMap->at(key)++;
+        ++pt->regMap->at(key);
     }
 
     if (pt->regState->find(reg) == pt->regState->end()){
-       pt->regState->emplace(reg, stateWord(cur_ctxt_hndl, (uint8_t)state));
+       stateWord word(cur_ctxt_hndl, state);
+       pt->regState->emplace(reg, word);
     }
     else{
-       pt->regState->at(reg).isWritten = (uint8_t)state;
+       pt->regState->at(reg).isWritten = state;
        pt->regState->at(reg).ctxt = cur_ctxt_hndl;
     }
 }
@@ -251,11 +252,12 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         int num_temp = opnd_num_regs_used(op);
         for (int j = 0; j < num_temp; j++){
             auto reg = opnd_get_reg_used(op, j);
+            // printf("Source Reg: %d \n", reg);
             dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 3,
                                 OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(0));
         }
-
     }
+
     for (int i = 0; i < instr_num_dsts(instr); i++) {
         opnd_t op = instr_get_dst(instr, i);
         int isReg = 1;
@@ -268,6 +270,7 @@ InstrumentInsCallback(void *drcontext, instr_instrument_msg_t *instrument_msg)
         int num_temp = opnd_num_regs_used(op);
         for (int j = 0; j < num_temp; j++){
             auto reg = opnd_get_reg_used(op, j);
+            // printf("Destination Reg: %d \n", reg);
             dr_insert_clean_call(drcontext, bb, instr, (void *)InsertCleancall_register, false, 3,
                                  OPND_CREATE_CCT_INT(slot), OPND_CREATE_CCT_INT(reg), OPND_CREATE_CCT_INT(isReg));
         }
@@ -357,7 +360,6 @@ print_stats(priority_queue<q_pair, vector<q_pair>, pq_cmp>& Q, const string& nam
 static void
 ClientThreadEnd(void *drcontext)
 {
-
     per_thread_t *pt = (per_thread_t *)drmgr_get_tls_field(drcontext, tls_idx);
 
     int dead_occ;
