@@ -78,35 +78,40 @@ post_malloc(void *wrapcxt, void *user_data)
     context_handle_t malloc_ctxt = drcctlib_get_context_handle(drwrap_get_drcontext(wrapcxt), 0);
     app_pc start = (app_pc)drwrap_get_retval(wrapcxt);
     app_pc redZone = start + (size_t)user_data;
+
+    printf("\nMalloc Context: %d, Malloc start address: %p, Data Size: %lu, redzone: %p \n", malloc_ctxt, start, (size_t)user_data, redZone);
     redMap[redZone] = malloc_ctxt;
     freeMap[start] = list<app_pc> {redZone};
 }
 
-/* Calloc Functions */
-static void
-pre_calloc(void *wrapcxt, OUT void **user_data)
-{
-    /* calloc(numitems, size) */
-    size_t nitems = (size_t)drwrap_get_arg(wrapcxt, 0);
-    *user_data = (void *)nitems;
-    nitems++;
-    drwrap_set_arg(wrapcxt, 0, (void *)nitems);
-}
-
-static void
-post_calloc(void *wrapcxt, void *user_data)
-{
-    context_handle_t calloc_ctxt = drcctlib_get_context_handle(drwrap_get_drcontext(wrapcxt), 0);
-    app_pc start = (app_pc)drwrap_get_retval(wrapcxt);
-    app_pc redZone = start + (size_t)user_data;
-    size_t nsize = (size_t)drwrap_get_arg(wrapcxt, 1);
-
-    freeMap[start] = list<app_pc> {};
-    for (app_pc i = redZone; i < redZone + nsize; i++){
-        redMap[i] = calloc_ctxt;
-        freeMap[start].push_back(i);
-    }
-}
+// /* Calloc Functions */
+// static void
+// pre_calloc(void *wrapcxt, OUT void **user_data)
+// {
+//     /* calloc(numitems, size) */
+//     size_t nitems = (size_t)drwrap_get_arg(wrapcxt, 0);
+//     *user_data = (void *)nitems;
+//     nitems++;
+//     drwrap_set_arg(wrapcxt, 0, (void *)nitems);
+// }
+//
+// TODO: nsize might not work in post_calloc
+// static void
+// post_calloc(void *wrapcxt, void *user_data)
+// {
+//     context_handle_t calloc_ctxt = drcctlib_get_context_handle(drwrap_get_drcontext(wrapcxt), 0);
+//     app_pc start = (app_pc)drwrap_get_retval(wrapcxt);
+//     app_pc redZone = start + (size_t)user_data;
+//     size_t nsize = (size_t)drwrap_get_arg(wrapcxt, 1);
+//
+//     printf("\nCalloc Context: %d, calloc start address: %p, nsize: %lu, RedZone: ", calloc_ctxt, start, nsize);
+//     freeMap[start] = list<app_pc> {};
+//     for (app_pc i = redZone; i < redZone + nsize; i++){
+//         redMap[i] = calloc_ctxt;
+//         printf("%p,", i);
+//         freeMap[start].push_back(i);
+//     }
+// }
 
 /* Free Functions */
 static void
@@ -131,10 +136,10 @@ module_load_event(void *drcontext, const module_data_t *mod, bool loaded)
         drwrap_wrap(towrap_malloc, pre_malloc, post_malloc);
     }
 
-    app_pc towrap_calloc = (app_pc)dr_get_proc_address(mod->handle, "calloc");
-    if (towrap_calloc != NULL) {
-        drwrap_wrap(towrap_calloc, pre_calloc, post_calloc);
-    }
+    // app_pc towrap_calloc = (app_pc)dr_get_proc_address(mod->handle, "calloc");
+    // if (towrap_calloc != NULL) {
+    //     drwrap_wrap(towrap_calloc, pre_calloc, post_calloc);
+    // }
 
     app_pc towrap_free = (app_pc)dr_get_proc_address(mod->handle, "free");
     if (towrap_free != NULL) {
@@ -152,6 +157,7 @@ DoWhatClientWantTodo(void *drcontext, context_handle_t cur_ctxt_hndl, mem_ref_t 
     app_pc iter = ref->addr;
     for (; iter < ref->addr + ref->size; iter++){
         if (redMap.find(iter) != redMap.end()){
+          printf("RedZone address: %p\n", iter);
           uint64_t key = redMap[iter]; // Malloc Context
           key <<= 32;
           key |= cur_ctxt_hndl; // Current Context
