@@ -72,7 +72,7 @@ pre_malloc(void *wrapcxt, OUT void **user_data)
     /* malloc(size) */
     size_t sz = (size_t)drwrap_get_arg(wrapcxt, 0);
     *user_data = (void *)sz;
-    sz++;
+    sz += RED_ZONE_WIDTH;
     drwrap_set_arg(wrapcxt, 0, (void*)sz);
 }
 
