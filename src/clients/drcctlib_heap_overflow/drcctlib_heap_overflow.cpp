@@ -27,6 +27,8 @@ using namespace std;
 
 static int tls_idx;
 
+static file_t gTraceFile;
+
 enum {
     INSTRACE_TLS_OFFS_BUF_PTR,
     INSTRACE_TLS_COUNT, /* total number of TLS slots allocated */
@@ -52,7 +54,9 @@ typedef struct _per_thread_t {
     void *cur_buf;
 } per_thread_t;
 
+#define RED_ZONE_WIDTH 20
 #define TLS_MEM_REF_BUFF_SIZE 100
+#define MAX_DEPTH_TO_BOTHER 6
 
 unordered_set<uint64_t> ctxtMap;
 
@@ -79,9 +83,14 @@ post_malloc(void *wrapcxt, void *user_data)
     app_pc start = (app_pc)drwrap_get_retval(wrapcxt);
     app_pc redZone = start + (size_t)user_data;
 
-    printf("\nMalloc Context: %d, Malloc start address: %p, Data Size: %lu, redzone: %p \n", malloc_ctxt, start, (size_t)user_data, redZone);
-    redMap[redZone] = malloc_ctxt;
-    freeMap[start] = list<app_pc> {redZone};
+    printf("\nMalloc Context: %d, malloc start address: %p, nsize: %lu, RedZones: ", malloc_ctxt, start, (size_t)user_data);
+
+    freeMap[start] = list<app_pc> {};
+    for (app_pc i = redZone; i < redZone + RED_ZONE_WIDTH; i++){
+        redMap[i] = malloc_ctxt;
+        printf(" %p,", i);
+        freeMap[start].push_back(i);
+    }
 }
 
 // /* Calloc Functions */
@@ -293,21 +302,47 @@ ClientThreadEnd(void *drcontext)
 static void
 ClientInit(int argc, const char *argv[])
 {
+  #ifdef ARM_CCTLIB
+  char name[MAXIMUM_PATH] = "arm.drcctlib_heap_overflow.log";
+  #else
+    char name[MAXIMUM_PATH] = "x86.drcctlib_heap_overflow.log";
+  #endif
 
+  cout << "Creating log file at: " << name << endl;
+
+  gTraceFile = dr_open_file(name, DR_FILE_WRITE_OVERWRITE | DR_FILE_ALLOW_LARGE);
+  DR_ASSERT(gTraceFile != INVALID_FILE);
 }
 
 static void
 ClientExit(void)
 {
-    // add output module here
+    unsigned int i = 0;
 
     for(auto& key : ctxtMap){
-      auto malloc_ctxt = (key & 0xFFFFFFFF00000000);
-      malloc_ctxt >>= 32;
-      auto overflow_ctxt = (key & 0x00000000FFFFFFFF);
-      cout << "Malloc Context: " << malloc_ctxt << " , Overflow Context: " << overflow_ctxt << endl;
+
+        auto malloc_ctxt = (key & 0xFFFFFFFF00000000);
+        malloc_ctxt >>= 32;
+        auto overflow_ctxt = (key & 0x00000000FFFFFFFF);
+
+        dr_fprintf(gTraceFile, "N0. %d Malloc_ctxt handle: %lld,  Overflow_ctxt handle %lld ====\n", i + 1,
+                  malloc_ctxt, overflow_ctxt);
+
+          // drcctlib_print_ctxt_hndl_msg(gTraceFile, cntxt_hndl, false, false);
+          dr_fprintf(gTraceFile, "====================================================================="
+                     "===========\n");
+          dr_fprintf(gTraceFile,  "\n*********** Overflow Context *********\n");
+          drcctlib_print_full_cct(gTraceFile, overflow_ctxt, true, false,
+                                  MAX_DEPTH_TO_BOTHER);
+          dr_fprintf(gTraceFile,  "\n************  Malloc Context *********\n");
+          drcctlib_print_full_cct(gTraceFile, malloc_ctxt, true, false,
+                                  MAX_DEPTH_TO_BOTHER);
+          dr_fprintf(gTraceFile, "====================================================================="
+                     "===========\n\n\n");
+          ++i;
     }
 
+    dr_close_file(gTraceFile);
     drcctlib_exit();
 
     if (!dr_raw_tls_cfree(tls_offs, INSTRACE_TLS_COUNT)) {

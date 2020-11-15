@@ -18,5 +18,6 @@ int main(){
 
    free(test_malloc);
    free(test_calloc);
+   
    return 0;
 }
